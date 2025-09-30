@@ -3,8 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Señales → PDF (iPhone friendly)</title>
+  <title>Señales → PDF (PWA)</title>
   <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0b1324">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <!-- jsPDF (se cachea con el Service Worker tras la primera visita online) -->
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <style>
     :root { --bg:#0b1324; --panel:#0f1a33; --ink:#eaf1ff; --muted:#9fb2d8; --brand:#4da3ff; --ok:#0dd37d; --err:#ff5d5d; }
@@ -28,7 +32,6 @@
     .hint { color: var(--muted); font-size: .9rem; }
     .ok { color: var(--ok); }
     .err { color: var(--err); }
-    /* inputs de archivo visibles para iOS (no display:none) pero discretos */
     input[type=file] { width:1px; height:1px; opacity:0; position:absolute; left:-9999px; }
   </style>
 </head>
@@ -36,7 +39,10 @@
   <div class="wrap">
     <div class="card">
       <h1>Imágenes de señales → PDF</h1>
-      <p class="hint">En iPhone, usa los botones azules (son <b>labels</b>) para abrir cámara/galería. Luego toca <b>Guardar PDF</b>.</p>
+      <p class="hint">
+        Abre con HTTPS para que iPhone permita ubicación. Al cargar cada foto se estampa <b>fecha/hora</b> y <b>lat/lon</b> en la imagen.
+        Tras la primera visita en línea, podrás usarla <b>sin conexión</b> (PWA).
+      </p>
 
       <div class="grid">
         <!-- Ítem 1 -->
@@ -84,6 +90,13 @@
   </div>
 
   <script>
+    // ====== PWA: registrar Service Worker ======
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(()=>{});
+      });
+    }
+
     const labels = {
       "sr30_30": "Señal SR-30(30)",
       "sr30_50": "Señal SR-30(50)",
@@ -99,6 +112,100 @@
     function $(id){ return document.getElementById(id); }
     function setStatus(t, cls=""){ const s=$("status"); s.textContent=t; s.className="hint "+cls; }
 
+    // ===== Utilidades =====
+    function fmt2(n){ return n<10 ? "0"+n : ""+n; }
+    function formatDateTime(d){
+      const Y=d.getFullYear(), M=fmt2(d.getMonth()+1), D=fmt2(d.getDate());
+      const h=fmt2(d.getHours()), m=fmt2(d.getMinutes()), s=fmt2(d.getSeconds());
+      return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+    }
+    function formatCoords(lat, lon, acc){
+      const ll = `Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}`;
+      return acc!=null ? `${ll} (±${Math.round(acc)} m)` : ll;
+    }
+
+    async function getGeoOnce(timeout=12000){
+      if (!('geolocation' in navigator)) return null;
+      return new Promise((resolve)=>{
+        const opt = { enableHighAccuracy:true, maximumAge:0, timeout };
+        navigator.geolocation.getCurrentPosition(
+          (pos)=> resolve({
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            acc: pos.coords.accuracy ?? null,
+            ts: new Date(pos.timestamp)
+          }),
+          (_)=> resolve(null),
+          opt
+        );
+      });
+    }
+
+    async function loadBitmapWithOrientation(file){
+      if ('createImageBitmap' in window) {
+        try {
+          const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+          return { type:'bitmap', bmp, width:bmp.width, height:bmp.height };
+        } catch(_) {}
+      }
+      const dataURL = await fileToDataURL(file);
+      const img = await loadImage(dataURL);
+      return { type:'image', img, width:img.naturalWidth, height:img.naturalHeight, dataURL };
+    }
+    function fileToDataURL(file){
+      return new Promise((resolve,reject)=>{
+        const fr = new FileReader();
+        fr.onload = ()=> resolve(fr.result);
+        fr.onerror = reject;
+        fr.readAsDataURL(file);
+      });
+    }
+    function loadImage(src){
+      return new Promise((resolve,reject)=>{
+        const im = new Image();
+        im.onload = ()=> resolve(im);
+        im.onerror = reject;
+        im.src = src;
+      });
+    }
+
+    async function renderStampedImage(file, overlayLines, maxW=2200, maxH=2200){
+      const src = await loadBitmapWithOrientation(file);
+      const r = Math.min(maxW/src.width, maxH/src.height, 1);
+      const cw = Math.round(src.width * r);
+      const ch = Math.round(src.height * r);
+      const canvas = document.createElement('canvas');
+      canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0,0,cw,ch);
+      if (src.type === 'bitmap') ctx.drawImage(src.bmp, 0, 0, cw, ch);
+      else ctx.drawImage(src.img, 0, 0, cw, ch);
+
+      const pad = Math.max(10, Math.round(cw*0.015));
+      const fontSize = Math.max(14, Math.round(cw*0.028));
+      ctx.font = `600 ${fontSize}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.textBaseline = 'bottom';
+
+      const lines = overlayLines.filter(Boolean);
+      const widths = lines.map(t=> ctx.measureText(t).width);
+      const maxTextW = widths.length ? Math.max(...widths) : 0;
+      const lineH = Math.round(fontSize * 1.2);
+      const boxW = Math.min(cw - pad*2, maxTextW + pad*2);
+      const boxH = lineH * lines.length + pad*1.2;
+
+      const x = pad, y = ch - pad;
+      ctx.fillStyle = "rgba(0,0,0,0.42)";
+      ctx.fillRect(x - pad*0.6, y - boxH, boxW + pad*0.6, boxH);
+
+      ctx.fillStyle = "#ffffff";
+      lines.forEach((t, i)=>{
+        ctx.fillText(t, x, y - (boxH - lineH*(i+1)) );
+      });
+
+      return canvas.toDataURL('image/jpeg', 0.9);
+    }
+
     // Limpiar
     document.querySelectorAll('[data-action="clear"]').forEach(b=>{
       b.addEventListener('click', ()=>{
@@ -111,27 +218,34 @@
       }, {passive:true});
     });
 
-    // Cargar imagen (gesto real: label for=input)
+    // Carga/estampa por foto
     Object.keys(cfg).forEach(key=>{
       $(cfg[key].file).addEventListener('change', async (e)=>{
         const file = e.target.files?.[0];
         if(!file) return;
         if(!file.type.startsWith('image/')) { setStatus('El archivo no es una imagen','err'); return; }
 
+        setStatus('Obteniendo ubicación…');
+        const geo = await getGeoOnce();
+        const now = new Date();
+        const timeStr = formatDateTime(now);
+        const coordStr = geo ? formatCoords(geo.lat, geo.lon, geo.acc) : 'Ubicación: no disponible';
+        const lines = [ timeStr, coordStr ];
+
         setStatus('Procesando imagen…');
         try{
-          const dataURL = await readAndResize(file, 2200, 2200);
-          state[key] = { dataURL, name:file.name };
+          const stamped = await renderStampedImage(file, lines, 2200, 2200);
+          state[key] = { dataURL: stamped, name:file.name, meta:{ time: now, geo } };
           const img = new Image();
           img.onload = ()=>{
             $(cfg[key].prev).innerHTML = '';
             $(cfg[key].prev).appendChild(img);
-            $(cfg[key].info).textContent = `${file.name} (${Math.round(file.size/1024)} KB)`;
-            setStatus('Imagen cargada','ok');
+            $(cfg[key].info).textContent = `${file.name} — ${timeStr}${geo ? ` — ${coordStr}` : ''}`;
+            setStatus('Imagen lista','ok');
             validateReady();
           };
           img.alt = labels[key];
-          img.src = dataURL;
+          img.src = stamped;
         }catch(err){
           console.error(err);
           setStatus('No se pudo procesar la imagen','err');
@@ -145,36 +259,10 @@
       return ok;
     }
 
-    // Redimensiona a JPEG DataURL
-    function readAndResize(file, maxW=2200, maxH=2200){
-      return new Promise((resolve,reject)=>{
-        const reader = new FileReader();
-        reader.onload = ()=>{
-          const img = new Image();
-          img.onload = ()=>{
-            let w = img.naturalWidth, h = img.naturalHeight;
-            const r = Math.min(maxW/w, maxH/h, 1);
-            const cw = Math.round(w*r), ch=Math.round(h*r);
-            const canvas = document.createElement('canvas');
-            canvas.width=cw; canvas.height=ch;
-            const ctx=canvas.getContext('2d');
-            ctx.fillStyle = "#ffffff"; ctx.fillRect(0,0,cw,ch);
-            ctx.drawImage(img,0,0,cw,ch);
-            resolve(canvas.toDataURL('image/jpeg', 0.9));
-          };
-          img.onerror = reject;
-          img.src = reader.result;
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-    }
-
-    // Guardar PDF (con fallback iOS)
+    // PDF + iOS fallback
     document.getElementById('savePdfBtn').addEventListener('click', async ()=>{
       if(!validateReady()){ setStatus('Faltan imágenes','err'); return; }
       setStatus('Generando PDF…');
-
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
       const pageW = doc.internal.pageSize.getWidth();
@@ -183,16 +271,15 @@
       const anchoImagen = pageW - margenX*2;
 
       async function addSection(titulo, dataURL){
-        const y0 = margenY;
         doc.setFont('helvetica','bold'); doc.setFontSize(14);
-        doc.text(titulo, margenX, y0);
-        const img = await loadImage(dataURL);
-        const ow = img.naturalWidth, oh = img.naturalHeight;
+        doc.text(titulo, margenX, margenY);
+        const im = await loadImage(dataURL);
+        const ow=im.naturalWidth, oh=im.naturalHeight;
         const escala = anchoImagen / ow;
         let alto = oh * escala;
-        const espacio = pageH - (y0+6) - margenY;
+        const espacio = pageH - (margenY+6) - margenY;
         if (alto > espacio) { const r = espacio/alto; alto *= r; }
-        doc.addImage(dataURL, 'JPEG', margenX, y0+6, anchoImagen, alto);
+        doc.addImage(dataURL, 'JPEG', margenX, margenY+6, anchoImagen, alto);
       }
 
       try{
@@ -205,53 +292,24 @@
 
         const filename = `senales_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.pdf`;
 
-        // 1) Intento estándar
-        try {
-          doc.save(filename);
-          setStatus('PDF guardado ✔', 'ok');
-          return;
-        } catch(_) {}
+        try { doc.save(filename); setStatus('PDF guardado ✔','ok'); return; } catch(_) {}
 
-        // 2) iOS Fallback: Blob + Share/abrir
         const blob = doc.output('blob');
-        const blobUrl = URL.createObjectURL(blob);
-
-        // intentar share sheet si está disponible
-        if (navigator.canShare && navigator.canShare({ files: [new File([blob], filename, {type:'application/pdf'})] })) {
-          try {
-            await navigator.share({ files: [new File([blob], filename, {type:'application/pdf'})] });
-            setStatus('Compartido ✔', 'ok');
-            URL.revokeObjectURL(blobUrl);
-            return;
-          } catch (_) { /* si cancela, seguimos abajo */ }
+        const file = new File([blob], filename, { type: 'application/pdf' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try { await navigator.share({ files:[file], title:'Reporte de Señales' }); setStatus('Compartido ✔','ok'); return; } catch(_) {}
         }
-
-        // abrir en nueva pestaña (iOS suele mostrar visor con opción “Compartir”/“Guardar en Archivos”)
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = blobUrl; a.target = '_blank'; a.rel = 'noopener';
-        // a.download se ignora en iOS, pero lo dejamos por si otros navegadores
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setStatus('Abierto el PDF, usa Compartir/Guardar', 'ok');
-
-        // liberar URL después de un rato
-        setTimeout(()=>URL.revokeObjectURL(blobUrl), 60000);
+        a.href = url; a.target='_blank'; a.rel='noopener'; a.download=filename;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setStatus('Abierto el PDF, usa Compartir/Guardar','ok');
+        setTimeout(()=>URL.revokeObjectURL(url), 60000);
       }catch(e){
         console.error(e);
         setStatus('No se pudo generar el PDF','err');
       }
-    }, {passive:false});
-
-    function loadImage(src){
-      return new Promise((resolve,reject)=>{
-        const img = new Image();
-        img.onload = ()=>resolve(img);
-        img.onerror = reject;
-        img.src = src;
-      });
-    }
+    });
   </script>
 </body>
 </html>
